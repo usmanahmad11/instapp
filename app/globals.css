@@ -1,0 +1,32 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  background: linear-gradient(135deg, #0f0c29 0%, #302b63 50%, #24243e 100%);
+  min-height: 100vh;
+}
+
+.instagram-gradient {
+  background: linear-gradient(45deg, #f09433, #e6683c, #dc2743, #cc2366, #bc1888);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+.glow-border {
+  box-shadow: 0 0 15px rgba(225, 48, 108, 0.3), 0 0 30px rgba(225, 48, 108, 0.1);
+}
+
+.glow-border:focus-within {
+  box-shadow: 0 0 20px rgba(225, 48, 108, 0.5), 0 0 40px rgba(225, 48, 108, 0.2);
+}
+
+@keyframes pulse-glow {
+  0%, 100% { box-shadow: 0 0 20px rgba(225, 48, 108, 0.4); }
+  50% { box-shadow: 0 0 30px rgba(225, 48, 108, 0.7); }
+}
+
+.animate-pulse-glow {
+  animation: pulse-glow 2s ease-in-out infinite;
+}

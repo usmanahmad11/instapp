@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm install:*)",
+      "Bash(where.exe npm:*)",
+      "Bash(where.exe node:*)",
+      "Read(//c/Program Files/**)",
+      "Read(//c/Program Files \\(x86\\)/**)",
+      "Read(//c/Users/USMAN AHMAD/Desktop/instaapp/$APPDATA/**)",
+      "Bash(cmd.exe /c \"where npm\")",
+      "Bash(export PATH=\"$APPDATA/npm:$PATH\")",
+      "Bash(npm --version)",
+      "Bash(cmd.exe /c \"where node\")",
+      "Read(//c//**)",
+      "Read(//c/Users/USMAN AHMAD/Desktop/instaapp/$HOME/**)",
+      "Read(//c/Users/USMAN AHMAD/AppData/Roaming/**)",
+      "Read(//c/Users/USMAN AHMAD/AppData/Local/**)",
+      "Bash(cmd.exe /c \"node --version\")",
+      "Bash(cmd.exe /c \"npm --version\")",
+      "Bash(powershell.exe -Command \"node --version; npm --version\")"
+    ]
+  }
+}
