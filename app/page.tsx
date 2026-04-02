@@ -14,6 +14,7 @@ export default function Home() {
   const [url, setUrl] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [debugInfo, setDebugInfo] = useState<string[]>([]);
   const [items, setItems] = useState<MediaItem[]>([]);
   const [downloadingIdx, setDownloadingIdx] = useState<number | null>(null);
   const [downloadingAll, setDownloadingAll] = useState(false);
@@ -24,6 +25,7 @@ export default function Home() {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError("");
+    setDebugInfo([]);
     setItems([]);
 
     const trimmed = url.trim();
@@ -44,7 +46,10 @@ export default function Home() {
         body: JSON.stringify({ url: trimmed }),
       });
       const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "Failed to fetch media");
+      if (!res.ok) {
+        if (data.debug) setDebugInfo(data.debug);
+        throw new Error(data.error || "Failed to fetch media");
+      }
       setItems(data.items || []);
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : "Something went wrong");
@@ -162,8 +167,16 @@ export default function Home() {
 
         {/* Error */}
         {error && (
-          <div className="mb-6 px-4 py-3 bg-red-500/10 border border-red-500/30 rounded-xl text-red-400 text-sm">
-            {error}
+          <div className="mb-6 px-4 py-3 bg-red-500/10 border border-red-500/30 rounded-xl text-red-400 text-sm text-left">
+            <p>{error}</p>
+            {debugInfo.length > 0 && (
+              <details className="mt-2">
+                <summary className="cursor-pointer text-red-500/70 text-xs">Debug info (click to expand)</summary>
+                <pre className="mt-1 text-[10px] text-red-400/60 whitespace-pre-wrap break-all">
+                  {debugInfo.join("\n")}
+                </pre>
+              </details>
+            )}
           </div>
         )}
 
