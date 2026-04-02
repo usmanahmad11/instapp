@@ -64,7 +64,12 @@ export default function Home() {
       const res = await fetch(
         `/api/proxy?url=${encodeURIComponent(item.url)}&type=${item.type}&dl=1`
       );
-      if (!res.ok) throw new Error("Download failed");
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(
+          errData.error || `Proxy failed (${res.status})`
+        );
+      }
       const blob = await res.blob();
       const blobUrl = URL.createObjectURL(blob);
       const a = document.createElement("a");
@@ -74,8 +79,8 @@ export default function Home() {
       a.click();
       document.body.removeChild(a);
       URL.revokeObjectURL(blobUrl);
-    } catch {
-      setError("Failed to download. Please try again.");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to download. Please try again.");
     } finally {
       setDownloadingIdx(null);
     }

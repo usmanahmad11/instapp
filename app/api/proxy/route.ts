@@ -1,49 +1,59 @@
 import { NextRequest, NextResponse } from "next/server";
 
-export const runtime = "nodejs";
+export const runtime = "edge";
 
 export async function GET(req: NextRequest) {
   const mediaUrl = req.nextUrl.searchParams.get("url");
   const mediaType = req.nextUrl.searchParams.get("type") || "image";
-  // dl=1 means force download headers, otherwise stream for preview
   const forceDownload = req.nextUrl.searchParams.get("dl") === "1";
 
   if (!mediaUrl) {
     return NextResponse.json({ error: "URL is required" }, { status: 400 });
   }
 
-  // Only allow proxying Instagram / Facebook CDN URLs
+  // Validate the URL is from Instagram/Facebook CDN
   try {
     const parsedUrl = new URL(mediaUrl);
-    const host = parsedUrl.hostname;
+    const host = parsedUrl.hostname.toLowerCase();
     const isAllowed =
       host.includes("scontent") ||
       host.includes("instagram") ||
       host.includes("cdninstagram") ||
-      host.endsWith(".fbcdn.net") ||
-      host.endsWith(".fna.fbcdn.net") ||
-      host.endsWith(".facebook.com") ||
-      host === "i.instagram.com";
+      host.includes("fbcdn") ||
+      host.includes("facebook") ||
+      host.includes("fbsbx") ||
+      host.includes("fna.");
     if (!isAllowed) {
-      return NextResponse.json({ error: "URL not allowed" }, { status: 403 });
+      return NextResponse.json(
+        { error: `Host not allowed: ${host}` },
+        { status: 403 }
+      );
     }
   } catch {
-    return NextResponse.json({ error: "Invalid URL" }, { status: 400 });
+    return NextResponse.json(
+      { error: `Invalid URL: ${mediaUrl.substring(0, 100)}` },
+      { status: 400 }
+    );
   }
 
   try {
     const response = await fetch(mediaUrl, {
       headers: {
         "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+          "Instagram 275.0.0.27.98 Android (33/13; 420dpi; 1080x2400; samsung; SM-G991B; o1s; exynos2100; en_US; 458229258)",
+        Accept: "*/*",
+        "Accept-Encoding": "identity",
         Referer: "https://www.instagram.com/",
-        Origin: "https://www.instagram.com",
       },
+      redirect: "follow",
     });
 
     if (!response.ok) {
       return NextResponse.json(
-        { error: "Failed to fetch media" },
+        {
+          error: `CDN returned ${response.status}`,
+          url: mediaUrl.substring(0, 120),
+        },
         { status: response.status }
       );
     }
@@ -51,7 +61,6 @@ export async function GET(req: NextRequest) {
     const contentType =
       response.headers.get("content-type") ||
       (mediaType === "video" ? "video/mp4" : "image/jpeg");
-    const contentLength = response.headers.get("content-length");
 
     const buffer = await response.arrayBuffer();
 
@@ -60,18 +69,18 @@ export async function GET(req: NextRequest) {
       ? `attachment; filename="instagram_${Date.now()}.${ext}"`
       : "inline";
 
-    const headers: Record<string, string> = {
-      "Content-Type": contentType,
-      "Content-Disposition": disposition,
-      "Cache-Control": "public, max-age=3600",
-      "Access-Control-Allow-Origin": "*",
-    };
-    if (contentLength) headers["Content-Length"] = contentLength;
-
-    return new NextResponse(buffer, { headers });
-  } catch {
+    return new NextResponse(buffer, {
+      headers: {
+        "Content-Type": contentType,
+        "Content-Disposition": disposition,
+        "Content-Length": buffer.byteLength.toString(),
+        "Cache-Control": "public, max-age=3600",
+        "Access-Control-Allow-Origin": "*",
+      },
+    });
+  } catch (e) {
     return NextResponse.json(
-      { error: "Failed to proxy media" },
+      { error: `Proxy fetch failed: ${String(e).substring(0, 200)}` },
       { status: 500 }
     );
   }
