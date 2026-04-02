@@ -61,26 +61,29 @@ export default function Home() {
   const downloadOne = async (item: MediaItem, index: number) => {
     setDownloadingIdx(index);
     try {
-      const res = await fetch(
-        `/api/proxy?url=${encodeURIComponent(item.url)}&type=${item.type}&dl=1`
-      );
-      if (!res.ok) {
-        const errData = await res.json().catch(() => ({}));
-        throw new Error(
-          errData.error || `Proxy failed (${res.status})`
-        );
+      // Attempt 1: Proxy download through our server
+      const proxyUrl = `/api/proxy?url=${encodeURIComponent(item.url)}&type=${item.type}`;
+      const res = await fetch(proxyUrl);
+
+      if (res.ok) {
+        const blob = await res.blob();
+        const blobUrl = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = blobUrl;
+        a.download = `instagram_${index + 1}_${Date.now()}.${item.type === "video" ? "mp4" : "jpg"}`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(blobUrl);
+        return;
       }
-      const blob = await res.blob();
-      const blobUrl = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = blobUrl;
-      a.download = `instagram_${index + 1}_${Date.now()}.${item.type === "video" ? "mp4" : "jpg"}`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(blobUrl);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to download. Please try again.");
+
+      // Attempt 2: Open the direct CDN URL in a new tab
+      // User's browser can access it (residential IP not blocked)
+      window.open(item.url, "_blank");
+    } catch {
+      // Fallback: open direct URL
+      window.open(item.url, "_blank");
     } finally {
       setDownloadingIdx(null);
     }
@@ -90,8 +93,7 @@ export default function Home() {
     setDownloadingAll(true);
     for (let i = 0; i < items.length; i++) {
       await downloadOne(items[i], i);
-      // small delay between downloads so browser doesn't block them
-      if (i < items.length - 1) await new Promise((r) => setTimeout(r, 500));
+      if (i < items.length - 1) await new Promise((r) => setTimeout(r, 600));
     }
     setDownloadingAll(false);
   };
@@ -104,9 +106,6 @@ export default function Home() {
       // clipboard access denied
     }
   };
-
-  const proxyUrl = (mediaUrl: string, type: string) =>
-    `/api/proxy?url=${encodeURIComponent(mediaUrl)}&type=${type}`;
 
   return (
     <main className="min-h-screen flex flex-col items-center justify-center px-4 py-12">
@@ -176,7 +175,9 @@ export default function Home() {
             <p>{error}</p>
             {debugInfo.length > 0 && (
               <details className="mt-2">
-                <summary className="cursor-pointer text-red-500/70 text-xs">Debug info (click to expand)</summary>
+                <summary className="cursor-pointer text-red-500/70 text-xs">
+                  Debug info (click to expand)
+                </summary>
                 <pre className="mt-1 text-[10px] text-red-400/60 whitespace-pre-wrap break-all">
                   {debugInfo.join("\n")}
                 </pre>
@@ -188,7 +189,7 @@ export default function Home() {
         {/* Results */}
         {items.length > 0 && (
           <div className="space-y-4">
-            {/* Download All button (for multi-item posts) */}
+            {/* Download All */}
             {items.length > 1 && (
               <div className="flex items-center justify-between bg-white/5 backdrop-blur-sm border border-white/10 rounded-2xl px-6 py-4">
                 <span className="text-gray-300 text-sm font-medium">
@@ -206,9 +207,7 @@ export default function Home() {
                     </>
                   ) : (
                     <>
-                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
-                      </svg>
+                      <DownloadIcon />
                       Download All
                     </>
                   )}
@@ -217,32 +216,33 @@ export default function Home() {
             )}
 
             {/* Media cards */}
-            <div className={`grid gap-4 ${items.length === 1 ? "grid-cols-1" : "grid-cols-1 sm:grid-cols-2"}`}>
+            <div
+              className={`grid gap-4 ${items.length === 1 ? "grid-cols-1" : "grid-cols-1 sm:grid-cols-2"}`}
+            >
               {items.map((item, idx) => (
                 <div
                   key={idx}
                   className="bg-white/5 backdrop-blur-sm border border-white/10 rounded-2xl p-4 transition-all hover:border-white/20"
                 >
-                  {/* Preview */}
+                  {/* Preview — direct CDN URL (browser can load cross-origin media) */}
                   <div className="mb-3 rounded-xl overflow-hidden bg-black/30 relative">
                     {item.type === "video" ? (
                       <video
-                        src={proxyUrl(item.url, "video")}
+                        src={item.url}
                         controls
+                        playsInline
                         className="w-full max-h-[400px] object-contain"
-                        poster={
-                          item.thumbnail
-                            ? proxyUrl(item.thumbnail, "image")
-                            : undefined
-                        }
+                        poster={item.thumbnail || undefined}
+                        crossOrigin="anonymous"
                       />
                     ) : (
                       // eslint-disable-next-line @next/next/no-img-element
                       <img
-                        src={proxyUrl(item.url, "image")}
+                        src={item.url}
                         alt={`Instagram media ${idx + 1}`}
                         className="w-full object-contain"
                         style={{ maxHeight: "500px" }}
+                        referrerPolicy="no-referrer"
                       />
                     )}
                     {/* Badge */}
@@ -289,9 +289,7 @@ export default function Home() {
                         </>
                       ) : (
                         <>
-                          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
-                          </svg>
+                          <DownloadIcon />
                           Download
                         </>
                       )}
@@ -317,6 +315,14 @@ function Spinner() {
     <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24">
       <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
       <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+    </svg>
+  );
+}
+
+function DownloadIcon() {
+  return (
+    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
     </svg>
   );
 }
