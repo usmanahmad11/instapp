@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 
-export const runtime = "edge";
+export const runtime = "nodejs";
+export const maxDuration = 30;
 
 interface MediaItem {
   type: "image" | "video";
@@ -18,36 +19,23 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "URL is required" }, { status: 400 });
     }
 
-    const instagramRegex =
-      /^https?:\/\/(www\.)?instagram\.com\/(p|reel|reels)\/[\w-]+/i;
-    if (!instagramRegex.test(url)) {
-      return NextResponse.json(
-        { error: "Invalid Instagram URL" },
-        { status: 400 }
-      );
+    if (!/^https?:\/\/(www\.)?instagram\.com\/(p|reel|reels)\/[\w-]+/i.test(url)) {
+      return NextResponse.json({ error: "Invalid Instagram URL" }, { status: 400 });
     }
 
     const shortcode = getShortcode(url);
     if (!shortcode) {
-      return NextResponse.json(
-        { error: "Could not extract post ID from URL" },
-        { status: 400 }
-      );
+      return NextResponse.json({ error: "Could not extract post ID" }, { status: 400 });
     }
 
     const cleanUrl = url.split("?")[0].replace(/\/$/, "") + "/";
-
-    // Try all methods, collect debug info
     const debug: string[] = [];
+
     const items = await extractAllMedia(shortcode, cleanUrl, debug);
 
     if (!items || items.length === 0) {
       return NextResponse.json(
-        {
-          error:
-            "Could not extract media. The post may be private or unavailable.",
-          debug,
-        },
+        { error: "Could not extract media. The post may be private or unavailable.", debug },
         { status: 404 }
       );
     }
@@ -55,16 +43,18 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ items });
   } catch (error) {
     return NextResponse.json(
-      {
-        error: "Failed to process the Instagram URL.",
-        debug: [String(error)],
-      },
+      { error: "Failed to process Instagram URL.", debug: [String(error)] },
       { status: 500 }
     );
   }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
+
+function getShortcode(url: string): string | null {
+  const match = url.match(/instagram\.com\/(?:p|reel|reels)\/([\w-]+)/);
+  return match ? match[1] : null;
+}
 
 function decodeUnicode(s: string): string {
   return s
@@ -75,546 +65,301 @@ function decodeUnicode(s: string): string {
     .replace(/\\\//g, "/");
 }
 
-function getShortcode(url: string): string | null {
-  const match = url.match(/instagram\.com\/(?:p|reel|reels)\/([\w-]+)/);
-  return match ? match[1] : null;
-}
-
-function shortcodeToMediaId(shortcode: string): string {
-  const alphabet =
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-  let mediaId = BigInt(0);
-  for (const char of shortcode) {
-    const idx = alphabet.indexOf(char);
-    if (idx === -1) continue;
-    mediaId = mediaId * BigInt(64) + BigInt(idx);
-  }
-  return mediaId.toString();
-}
-
-// ── Main pipeline ────────────────────────────────────────────────────────────
+// ── Pipeline ─────────────────────────────────────────────────────────────────
 
 async function extractAllMedia(
   shortcode: string,
   cleanUrl: string,
   debug: string[]
 ): Promise<MediaItem[]> {
-  // Method 1: Mobile API
-  try {
-    const items = await fetchFromMobileApi(shortcode, debug);
-    if (items.length > 0) return items;
-  } catch (e) {
-    debug.push(`M1 exception: ${e}`);
+  // Method 1: Third-party scraper services (most reliable from cloud)
+  for (const fetcher of [fetchFromSaveIG, fetchFromSnapInsta]) {
+    try {
+      const items = await fetcher(cleanUrl, debug);
+      if (items.length > 0) return items;
+    } catch (e) {
+      debug.push(`service error: ${e}`);
+    }
   }
 
-  // Method 2: GraphQL
+  // Method 2: Instagram GraphQL POST (doc_id method)
   try {
     const items = await fetchFromGraphQL(shortcode, debug);
     if (items.length > 0) return items;
   } catch (e) {
-    debug.push(`M2 exception: ${e}`);
+    debug.push(`graphql error: ${e}`);
   }
 
-  // Method 3: Web page with different UAs
+  // Method 3: Page scraping with crawler UAs
   try {
-    const items = await fetchFromWebPage(cleanUrl, debug);
+    const items = await fetchFromPage(cleanUrl, debug);
     if (items.length > 0) return items;
   } catch (e) {
-    debug.push(`M3 exception: ${e}`);
-  }
-
-  // Method 4: Embed page
-  try {
-    const items = await fetchFromEmbed(cleanUrl, debug);
-    if (items.length > 0) return items;
-  } catch (e) {
-    debug.push(`M4 exception: ${e}`);
-  }
-
-  // Method 5: oEmbed (only gives thumbnail but at least works)
-  try {
-    const items = await fetchFromOEmbed(cleanUrl, debug);
-    if (items.length > 0) return items;
-  } catch (e) {
-    debug.push(`M5 exception: ${e}`);
+    debug.push(`page error: ${e}`);
   }
 
   return [];
 }
 
-// ── Method 1: Mobile API ─────────────────────────────────────────────────────
+// ── Method 1a: SaveIG API ────────────────────────────────────────────────────
 
-async function fetchFromMobileApi(
-  shortcode: string,
-  debug: string[]
-): Promise<MediaItem[]> {
-  const mediaId = shortcodeToMediaId(shortcode);
-  const apiUrl = `https://i.instagram.com/api/v1/media/${mediaId}/info/`;
-
-  const res = await fetch(apiUrl, {
-    headers: {
-      "User-Agent":
-        "Instagram 275.0.0.27.98 Android (33/13; 420dpi; 1080x2400; samsung; SM-G991B; o1s; exynos2100; en_US; 458229258)",
-      Accept: "*/*",
-      "X-IG-App-ID": "936619743392459",
-    },
-  });
-
-  debug.push(`M1 mobile-api: ${res.status} ${res.statusText}`);
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    debug.push(`M1 body: ${text.substring(0, 200)}`);
-    return [];
-  }
-
-  const ct = res.headers.get("content-type") || "";
-  if (!ct.includes("json")) {
-    debug.push(`M1 not-json: ${ct}`);
-    return [];
-  }
-
-  const data = await res.json();
-  const mediaItems = data?.items;
-  if (!Array.isArray(mediaItems) || mediaItems.length === 0) {
-    debug.push("M1 no items in response");
-    return [];
-  }
-
-  return parseMobileApiItem(mediaItems[0]);
-}
-
-// ── Method 2: GraphQL ────────────────────────────────────────────────────────
-
-async function fetchFromGraphQL(
-  shortcode: string,
-  debug: string[]
-): Promise<MediaItem[]> {
-  const variables = JSON.stringify({
-    shortcode,
-    child_comment_count: 0,
-    fetch_comment_count: 0,
-    parent_comment_count: 0,
-    has_threaded_comments: false,
-  });
-  const queryHash = "b3055c01b4b222b8a47dc12b090e4e64";
-  const gqlUrl = `https://www.instagram.com/graphql/query/?query_hash=${queryHash}&variables=${encodeURIComponent(variables)}`;
-
-  const res = await fetch(gqlUrl, {
-    headers: {
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-      Accept: "*/*",
-      "X-IG-App-ID": "936619743392459",
-      "X-Requested-With": "XMLHttpRequest",
-      Referer: "https://www.instagram.com/",
-    },
-  });
-
-  debug.push(`M2 graphql: ${res.status}`);
-  if (!res.ok) return [];
-
-  const ct = res.headers.get("content-type") || "";
-  if (!ct.includes("json")) {
-    debug.push(`M2 not-json: ${ct}`);
-    return [];
-  }
-
-  const data = await res.json();
-  const media = data?.data?.shortcode_media;
-  if (!media) {
-    debug.push("M2 no shortcode_media");
-    return [];
-  }
-
-  return parseGraphQLMedia(media);
-}
-
-// ── Method 3: Web page scraping ──────────────────────────────────────────────
-
-async function fetchFromWebPage(
-  url: string,
-  debug: string[]
-): Promise<MediaItem[]> {
-  const userAgents = [
-    // Googlebot - Instagram serves content to search crawlers
-    "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
-    // Facebook crawler
-    "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
-    // WhatsApp
-    "WhatsApp/2.23.20.0",
-    // Regular browser
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-  ];
-
-  for (let i = 0; i < userAgents.length; i++) {
-    const res = await fetch(url, {
+async function fetchFromSaveIG(url: string, debug: string[]): Promise<MediaItem[]> {
+  try {
+    const res = await fetch("https://v3.saveig.app/api/ajaxSearch", {
+      method: "POST",
       headers: {
-        "User-Agent": userAgents[i],
-        Accept: "text/html,application/xhtml+xml",
-        "Accept-Language": "en-US,en;q=0.9",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        Accept: "*/*",
+        Origin: "https://saveig.app",
+        Referer: "https://saveig.app/",
       },
-      redirect: "follow",
+      body: `q=${encodeURIComponent(url)}&t=media&lang=en`,
     });
 
-    debug.push(`M3 ua${i}: ${res.status}`);
-    if (!res.ok) continue;
+    debug.push(`saveig: ${res.status}`);
+    if (!res.ok) return [];
 
-    const html = await res.text();
-
-    // Skip login pages
-    if (
-      html.includes("/accounts/login") &&
-      !html.includes("og:image")
-    ) {
-      debug.push(`M3 ua${i}: login-redirect`);
-      continue;
+    const data = await res.json();
+    if (data.status !== "ok" || !data.data) {
+      debug.push(`saveig: status=${data.status}`);
+      return [];
     }
 
-    const items = extractFromHtml(html);
-    if (items.length > 0) {
-      debug.push(`M3 ua${i}: found ${items.length} items`);
-      return items;
-    }
-
-    debug.push(`M3 ua${i}: no items extracted (html length: ${html.length})`);
-  }
-
-  return [];
-}
-
-// ── Method 4: Embed page ─────────────────────────────────────────────────────
-
-async function fetchFromEmbed(
-  url: string,
-  debug: string[]
-): Promise<MediaItem[]> {
-  for (const suffix of ["/embed/captioned/", "/embed/"]) {
-    const embedUrl = url.replace(/\/$/, "") + suffix;
-    const res = await fetch(embedUrl, {
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
-        Accept: "text/html",
-      },
-      redirect: "follow",
-    });
-
-    debug.push(`M4 ${suffix}: ${res.status}`);
-    if (!res.ok) continue;
-
-    const html = await res.text();
-    if (html.includes("/accounts/login")) {
-      debug.push(`M4 ${suffix}: login-redirect`);
-      continue;
-    }
-
-    const items = extractFromHtml(html);
-    if (items.length > 0) {
-      debug.push(`M4 ${suffix}: found ${items.length} items`);
-      return items;
-    }
-    debug.push(`M4 ${suffix}: no items (html: ${html.length})`);
-  }
-
-  return [];
-}
-
-// ── Method 5: oEmbed (last resort — only thumbnail) ──────────────────────────
-
-async function fetchFromOEmbed(
-  url: string,
-  debug: string[]
-): Promise<MediaItem[]> {
-  // Try the public oEmbed endpoint
-  const oembedUrl = `https://api.instagram.com/oembed/?url=${encodeURIComponent(url)}&maxwidth=1080`;
-  const res = await fetch(oembedUrl, {
-    headers: {
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-      Accept: "application/json",
-    },
-  });
-
-  debug.push(`M5 oembed: ${res.status}`);
-  if (!res.ok) return [];
-
-  const ct = res.headers.get("content-type") || "";
-  if (!ct.includes("json")) {
-    debug.push(`M5 not-json: ${ct}`);
+    // Parse the HTML response to extract download links
+    const html: string = data.data;
+    return parseServiceHtml(html, debug, "saveig");
+  } catch (e) {
+    debug.push(`saveig err: ${e}`);
     return [];
   }
-
-  const data = await res.json();
-  if (data.thumbnail_url) {
-    // Try to get higher res by modifying the CDN URL
-    let imageUrl = data.thumbnail_url;
-    // Remove size restrictions from CDN URL
-    imageUrl = imageUrl.replace(/\/s\d+x\d+\//, "/");
-    imageUrl = imageUrl.replace(/\/c[\d.]+a?\//, "/");
-
-    const isVideo =
-      data.type === "video" ||
-      (data.html && data.html.includes("data-instgrm-type=\"video\""));
-
-    return [
-      {
-        type: isVideo ? "video" : "image",
-        url: imageUrl,
-        width: data.thumbnail_width,
-        height: data.thumbnail_height,
-      },
-    ];
-  }
-
-  debug.push("M5 no thumbnail_url");
-  return [];
 }
 
-// ── HTML extraction (shared by Methods 3 & 4) ───────────────────────────────
+// ── Method 1b: SnapInsta API ─────────────────────────────────────────────────
 
-function extractFromHtml(html: string): MediaItem[] {
-  // Strategy 1: window.__additionalDataLoaded
-  const addDataRegex =
-    /window\.__additionalDataLoaded\s*\(\s*['"][^'"]*['"]\s*,\s*(\{.+?\})\s*\)\s*;/g;
-  let match: RegExpExecArray | null;
-  while ((match = addDataRegex.exec(html)) !== null) {
+async function fetchFromSnapInsta(url: string, debug: string[]): Promise<MediaItem[]> {
+  try {
+    const res = await fetch("https://snapinsta.app/action2.php", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        Accept: "*/*",
+        Origin: "https://snapinsta.app",
+        Referer: "https://snapinsta.app/",
+      },
+      body: `url=${encodeURIComponent(url)}`,
+    });
+
+    debug.push(`snapinsta: ${res.status}`);
+    if (!res.ok) return [];
+
+    const text = await res.text();
+    // Try as JSON first
     try {
-      const data = JSON.parse(match[1]);
-      const media =
-        data?.graphql?.shortcode_media || data?.shortcode_media;
-      if (media) {
-        const items = parseGraphQLMedia(media);
-        if (items.length > 0) return items;
+      const data = JSON.parse(text);
+      if (data.data) {
+        return parseServiceHtml(data.data, debug, "snapinsta");
       }
     } catch {
-      // next
+      // Response might be direct HTML
+      return parseServiceHtml(text, debug, "snapinsta");
     }
+
+    return [];
+  } catch (e) {
+    debug.push(`snapinsta err: ${e}`);
+    return [];
   }
-
-  // Strategy 2: window._sharedData
-  const sharedDataMatch = html.match(
-    /window\._sharedData\s*=\s*(\{.+?\})\s*;/
-  );
-  if (sharedDataMatch) {
-    try {
-      const data = JSON.parse(sharedDataMatch[1]);
-      const media =
-        data?.entry_data?.PostPage?.[0]?.graphql?.shortcode_media ||
-        data?.entry_data?.PostPage?.[0]?.shortcode_media;
-      if (media) {
-        const items = parseGraphQLMedia(media);
-        if (items.length > 0) return items;
-      }
-    } catch {
-      // continue
-    }
-  }
-
-  // Strategy 3: Brace-balanced extraction of shortcode_media
-  const scmIndex = html.indexOf('"shortcode_media"');
-  if (scmIndex !== -1) {
-    const colonIdx = html.indexOf(":", scmIndex + 17);
-    if (colonIdx !== -1) {
-      const braceIdx = html.indexOf("{", colonIdx);
-      if (braceIdx !== -1) {
-        const jsonStr = extractBalancedJson(html, braceIdx);
-        if (jsonStr) {
-          try {
-            const media = JSON.parse(jsonStr);
-            const items = parseGraphQLMedia(media);
-            if (items.length > 0) return items;
-          } catch {
-            // continue
-          }
-        }
-      }
-    }
-  }
-
-  // Strategy 4: Regex fallback
-  const regexItems = regexExtractMedia(html);
-  if (regexItems.length > 0) return regexItems;
-
-  // Strategy 5: og:image / og:video from meta tags (absolute last resort)
-  const ogItems: MediaItem[] = [];
-
-  const ogVideoMatch = html.match(
-    /<meta[^>]*property=["']og:video(?::secure_url)?["'][^>]*content=["']([^"']+)["']/
-  );
-  if (ogVideoMatch) {
-    const ogImageMatch = html.match(
-      /<meta[^>]*property=["']og:image["'][^>]*content=["']([^"']+)["']/
-    );
-    ogItems.push({
-      type: "video",
-      url: ogVideoMatch[1],
-      thumbnail: ogImageMatch ? ogImageMatch[1] : undefined,
-    });
-  }
-
-  const ogImageMatch = html.match(
-    /<meta[^>]*property=["']og:image["'][^>]*content=["']([^"']+)["']/
-  );
-  if (ogImageMatch && ogItems.length === 0) {
-    // Remove size/crop params for full resolution
-    let imgUrl = ogImageMatch[1];
-    imgUrl = imgUrl.replace(/\/s\d+x\d+\//, "/");
-    imgUrl = imgUrl.replace(/\/c[\d.]+a?\//, "/");
-    ogItems.push({ type: "image", url: imgUrl });
-  }
-
-  return ogItems;
 }
 
-function extractBalancedJson(
-  str: string,
-  startIdx: number,
-  maxLen = 500000
-): string | null {
-  if (str[startIdx] !== "{") return null;
-  let depth = 0;
-  let inString = false;
-  let escape = false;
-  const end = Math.min(str.length, startIdx + maxLen);
+// ── Parse HTML from third-party services ─────────────────────────────────────
 
-  for (let i = startIdx; i < end; i++) {
-    const c = str[i];
-    if (escape) {
-      escape = false;
-      continue;
-    }
-    if (c === "\\") {
-      escape = true;
-      continue;
-    }
-    if (c === '"') {
-      inString = !inString;
-      continue;
-    }
-    if (inString) continue;
-    if (c === "{") depth++;
-    if (c === "}") {
-      depth--;
-      if (depth === 0) return str.substring(startIdx, i + 1);
-    }
-  }
-  return null;
-}
-
-function regexExtractMedia(html: string): MediaItem[] {
+function parseServiceHtml(html: string, debug: string[], source: string): MediaItem[] {
   const items: MediaItem[] = [];
-  const seenUrls = new Set<string>();
+  const seen = new Set<string>();
 
-  // Videos
-  const simpleVideoRegex = /"video_url"\s*:\s*"([^"]+)"/g;
-  let svm: RegExpExecArray | null;
-  while ((svm = simpleVideoRegex.exec(html)) !== null) {
-    const videoUrl = decodeUnicode(svm[1]);
-    if (!seenUrls.has(videoUrl)) {
-      seenUrls.add(videoUrl);
-      items.push({ type: "video", url: videoUrl });
-    }
+  // Extract all download links (usually in <a> tags with download URLs)
+  // Pattern: href="https://...cdninstagram.com/..." or similar CDN URLs
+  const linkRegex = /href=["']([^"']+)["']/g;
+  let match: RegExpExecArray | null;
+  while ((match = linkRegex.exec(html)) !== null) {
+    let href = match[1].replace(/&amp;/g, "&");
+
+    // Skip non-media links
+    if (
+      href.startsWith("#") ||
+      href.startsWith("javascript:") ||
+      href.includes("saveig.app") ||
+      href.includes("snapinsta.app") ||
+      (!href.includes("cdninstagram") &&
+        !href.includes("scontent") &&
+        !href.includes("fbcdn") &&
+        !href.includes(".mp4") &&
+        !href.includes(".jpg") &&
+        !href.includes("instagram"))
+    )
+      continue;
+
+    if (seen.has(href)) continue;
+    seen.add(href);
+
+    const isVideo = href.includes(".mp4") || href.includes("video");
+    items.push({ type: isVideo ? "video" : "image", url: href });
   }
 
-  // Images from display_resources
-  const drRegex = /"display_resources"\s*:\s*\[([^\]]+)\]/g;
-  let drm: RegExpExecArray | null;
-  while ((drm = drRegex.exec(html)) !== null) {
-    try {
-      const arr = JSON.parse("[" + drm[1] + "]");
-      if (Array.isArray(arr) && arr.length > 0) {
-        arr.sort(
-          (a: { config_width: number }, b: { config_width: number }) =>
-            b.config_width - a.config_width
-        );
-        const bestUrl = decodeUnicode(arr[0].src);
-        if (!seenUrls.has(bestUrl)) {
-          seenUrls.add(bestUrl);
-          items.push({ type: "image", url: bestUrl });
-        }
-      }
-    } catch {
-      // skip
-    }
+  // Also try to find src= attributes for images/videos
+  const srcRegex = /src=["']([^"']+(?:cdninstagram|scontent|fbcdn)[^"']*)["']/g;
+  while ((match = srcRegex.exec(html)) !== null) {
+    let src = match[1].replace(/&amp;/g, "&");
+    if (seen.has(src)) continue;
+    seen.add(src);
+
+    const isVideo = src.includes(".mp4") || src.includes("video");
+    items.push({ type: isVideo ? "video" : "image", url: src });
   }
 
-  // display_url
-  const duRegex = /"display_url"\s*:\s*"([^"]+)"/g;
-  let dum: RegExpExecArray | null;
-  while ((dum = duRegex.exec(html)) !== null) {
-    const imgUrl = decodeUnicode(dum[1]);
-    if (!seenUrls.has(imgUrl)) {
-      seenUrls.add(imgUrl);
-      items.push({ type: "image", url: imgUrl });
-    }
+  // Try to find download_link or download_url in JSON-like data
+  const dlRegex = /["'](?:download_link|download_url|url)["']\s*:\s*["']([^"']+)["']/g;
+  while ((match = dlRegex.exec(html)) !== null) {
+    let dl = match[1].replace(/\\u0026/g, "&").replace(/\\\//g, "/");
+    if (seen.has(dl)) continue;
+    seen.add(dl);
+
+    const isVideo = dl.includes(".mp4") || dl.includes("video");
+    items.push({ type: isVideo ? "video" : "image", url: dl });
   }
 
+  debug.push(`${source}: parsed ${items.length} items`);
   return items;
 }
 
-// ── Mobile API parser ────────────────────────────────────────────────────────
+// ── Method 2: GraphQL POST ───────────────────────────────────────────────────
 
-function parseMobileApiItem(item: Record<string, unknown>): MediaItem[] {
-  const results: MediaItem[] = [];
-  const carouselMedia = item.carousel_media as
-    | Array<Record<string, unknown>>
-    | undefined;
+async function fetchFromGraphQL(shortcode: string, debug: string[]): Promise<MediaItem[]> {
+  const docIds = ["10015901848480474", "8845758582119845"];
 
-  if (carouselMedia && Array.isArray(carouselMedia) && carouselMedia.length > 0) {
-    for (const slide of carouselMedia) {
-      results.push(parseMobileNode(slide));
+  for (const docId of docIds) {
+    try {
+      const body = new URLSearchParams({
+        variables: JSON.stringify({ shortcode }),
+        doc_id: docId,
+        lsd: "AVqbxe3J_YA",
+      });
+
+      const res = await fetch("https://www.instagram.com/api/graphql", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+          "X-IG-App-ID": "936619743392459",
+          "X-FB-LSD": "AVqbxe3J_YA",
+          "X-ASBD-ID": "129477",
+          Accept: "*/*",
+          Origin: "https://www.instagram.com",
+          Referer: "https://www.instagram.com/",
+        },
+        body: body.toString(),
+      });
+
+      debug.push(`graphql doc=${docId}: ${res.status}`);
+      if (!res.ok) continue;
+
+      const ct = res.headers.get("content-type") || "";
+      if (!ct.includes("json")) continue;
+
+      const data = await res.json();
+      const media = data?.data?.xdt_shortcode_media || data?.data?.shortcode_media;
+      if (!media) {
+        debug.push(`graphql doc=${docId}: no media`);
+        continue;
+      }
+
+      return parseGraphQLMedia(media);
+    } catch (e) {
+      debug.push(`graphql doc=${docId}: ${e}`);
     }
-  } else {
-    results.push(parseMobileNode(item));
   }
 
-  return results;
+  return [];
 }
 
-function parseMobileNode(node: Record<string, unknown>): MediaItem {
-  const mediaType = node.media_type as number;
-  const isVideo = mediaType === 2 || !!node.video_versions;
+// ── Method 3: Page scraping ──────────────────────────────────────────────────
 
-  let imageUrl = "";
-  let width: number | undefined;
-  let height: number | undefined;
+async function fetchFromPage(url: string, debug: string[]): Promise<MediaItem[]> {
+  const uas = [
+    "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
+    "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+  ];
 
-  const imageVersions2 = node.image_versions2 as
-    | { candidates: Array<{ url: string; width: number; height: number }> }
-    | undefined;
+  for (let i = 0; i < uas.length; i++) {
+    try {
+      const res = await fetch(url, {
+        headers: { "User-Agent": uas[i], Accept: "text/html" },
+        redirect: "follow",
+      });
 
-  if (imageVersions2?.candidates && imageVersions2.candidates.length > 0) {
-    const sorted = [...imageVersions2.candidates].sort(
-      (a, b) => b.width - a.width
-    );
-    imageUrl = sorted[0].url;
-    width = sorted[0].width;
-    height = sorted[0].height;
-  }
+      debug.push(`page ua${i}: ${res.status}`);
+      if (!res.ok) continue;
 
-  if (isVideo) {
-    let videoUrl = "";
-    const videoVersions = node.video_versions as
-      | Array<{ url: string; width: number; height: number }>
-      | undefined;
+      const html = await res.text();
+      if (html.includes("/accounts/login") && !html.includes("og:image")) continue;
 
-    if (videoVersions && videoVersions.length > 0) {
-      const sorted = [...videoVersions].sort((a, b) => b.width - a.width);
-      videoUrl = sorted[0].url;
-      width = sorted[0].width;
-      height = sorted[0].height;
+      const items = extractFromHtml(html);
+      if (items.length > 0) return items;
+    } catch (e) {
+      debug.push(`page ua${i}: ${e}`);
     }
-
-    return {
-      type: "video",
-      url: videoUrl,
-      thumbnail: imageUrl || undefined,
-      width,
-      height,
-    };
   }
 
-  return { type: "image", url: imageUrl, width, height };
+  return [];
+}
+
+// ── HTML extraction ──────────────────────────────────────────────────────────
+
+function extractFromHtml(html: string): MediaItem[] {
+  const items: MediaItem[] = [];
+  const seen = new Set<string>();
+
+  // Video URLs
+  const videoRegex = /"video_url"\s*:\s*"([^"]+)"/g;
+  let m: RegExpExecArray | null;
+  while ((m = videoRegex.exec(html)) !== null) {
+    const u = decodeUnicode(m[1]);
+    if (!seen.has(u)) { seen.add(u); items.push({ type: "video", url: u }); }
+  }
+
+  // Image URLs from display_resources (highest res)
+  const drRegex = /"display_resources"\s*:\s*\[([^\]]+)\]/g;
+  while ((m = drRegex.exec(html)) !== null) {
+    try {
+      const arr = JSON.parse("[" + m[1] + "]");
+      if (Array.isArray(arr) && arr.length > 0) {
+        arr.sort((a: { config_width: number }, b: { config_width: number }) => b.config_width - a.config_width);
+        const u = decodeUnicode(arr[0].src);
+        if (!seen.has(u)) { seen.add(u); items.push({ type: "image", url: u }); }
+      }
+    } catch { /* skip */ }
+  }
+
+  // display_url fallback
+  const duRegex = /"display_url"\s*:\s*"([^"]+)"/g;
+  while ((m = duRegex.exec(html)) !== null) {
+    const u = decodeUnicode(m[1]);
+    if (!seen.has(u)) { seen.add(u); items.push({ type: "image", url: u }); }
+  }
+
+  if (items.length > 0) return items;
+
+  // og: meta tags (last resort)
+  const ogVid = html.match(/<meta[^>]*property=["']og:video(?::secure_url)?["'][^>]*content=["']([^"']+)["']/);
+  if (ogVid) items.push({ type: "video", url: ogVid[1] });
+
+  const ogImg = html.match(/<meta[^>]*property=["']og:image["'][^>]*content=["']([^"']+)["']/);
+  if (ogImg && !ogVid) items.push({ type: "image", url: ogImg[1] });
+
+  return items;
 }
 
 // ── GraphQL parser ───────────────────────────────────────────────────────────
@@ -625,54 +370,36 @@ function parseGraphQLMedia(media: Record<string, unknown>): MediaItem[] {
     | { edges: Array<{ node: Record<string, unknown> }> }
     | undefined;
 
-  if (sidecar?.edges && Array.isArray(sidecar.edges) && sidecar.edges.length > 0) {
-    for (const edge of sidecar.edges) {
-      items.push(parseGraphQLNode(edge.node));
-    }
+  if (sidecar?.edges?.length) {
+    for (const edge of sidecar.edges) items.push(parseNode(edge.node));
   } else {
-    items.push(parseGraphQLNode(media));
+    items.push(parseNode(media));
   }
-
   return items;
 }
 
-function parseGraphQLNode(node: Record<string, unknown>): MediaItem {
+function parseNode(node: Record<string, unknown>): MediaItem {
   const isVideo = node.is_video === true;
+
   let imageUrl = "";
   let width: number | undefined;
   let height: number | undefined;
 
-  const displayResources = node.display_resources as
-    | Array<{ src: string; config_width: number; config_height: number }>
-    | undefined;
-
-  if (displayResources && displayResources.length > 0) {
-    const sorted = [...displayResources].sort(
-      (a, b) => b.config_width - a.config_width
-    );
-    imageUrl = decodeUnicode(sorted[0].src);
-    width = sorted[0].config_width;
-    height = sorted[0].config_height;
+  const resources = node.display_resources as Array<{ src: string; config_width: number; config_height: number }> | undefined;
+  if (resources?.length) {
+    const best = [...resources].sort((a, b) => b.config_width - a.config_width)[0];
+    imageUrl = decodeUnicode(best.src);
+    width = best.config_width;
+    height = best.config_height;
   } else if (typeof node.display_url === "string") {
     imageUrl = decodeUnicode(node.display_url);
   }
 
-  const dimensions = node.dimensions as
-    | { width: number; height: number }
-    | undefined;
-  if (!width && dimensions) {
-    width = dimensions.width;
-    height = dimensions.height;
-  }
+  const dims = node.dimensions as { width: number; height: number } | undefined;
+  if (!width && dims) { width = dims.width; height = dims.height; }
 
   if (isVideo && typeof node.video_url === "string") {
-    return {
-      type: "video",
-      url: decodeUnicode(node.video_url),
-      thumbnail: imageUrl || undefined,
-      width,
-      height,
-    };
+    return { type: "video", url: decodeUnicode(node.video_url), thumbnail: imageUrl || undefined, width, height };
   }
 
   return { type: "image", url: imageUrl, width, height };

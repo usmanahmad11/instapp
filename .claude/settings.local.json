@@ -17,7 +17,18 @@
       "Read(//c/Users/USMAN AHMAD/AppData/Local/**)",
       "Bash(cmd.exe /c \"node --version\")",
       "Bash(cmd.exe /c \"npm --version\")",
-      "Bash(powershell.exe -Command \"node --version; npm --version\")"
+      "Bash(powershell.exe -Command \"node --version; npm --version\")",
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:scrapfly.io)",
+      "WebFetch(domain:www.npmjs.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:security.snyk.io)",
+      "WebFetch(domain:opensourcemalware.com)",
+      "Bash(npm view:*)",
+      "Bash(export PATH=\"$PATH:/c/Program Files/nodejs\")",
+      "Bash(export PATH=\"$PATH:/c/Users/USMAN AHMAD/AppData/Roaming/npm\")",
+      "WebFetch(domain:registry.npmjs.org)"
     ]
   }
 }

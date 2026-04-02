@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useCallback } from "react";
 
 interface MediaItem {
   type: "image" | "video";
@@ -18,25 +18,28 @@ export default function Home() {
   const [items, setItems] = useState<MediaItem[]>([]);
   const [downloadingIdx, setDownloadingIdx] = useState<number | null>(null);
   const [downloadingAll, setDownloadingAll] = useState(false);
+  const [failedPreviews, setFailedPreviews] = useState<Set<number>>(new Set());
 
   const isValidInstagramUrl = (u: string) =>
     /^https?:\/\/(www\.)?instagram\.com\/(p|reel|reels)\/[\w-]+/i.test(u);
+
+  const proxyUrl = useCallback(
+    (mediaUrl: string, type: string) =>
+      `/api/proxy?url=${encodeURIComponent(mediaUrl)}&type=${type}`,
+    []
+  );
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError("");
     setDebugInfo([]);
     setItems([]);
+    setFailedPreviews(new Set());
 
     const trimmed = url.trim();
-    if (!trimmed) {
-      setError("Please paste an Instagram URL");
-      return;
-    }
-    if (!isValidInstagramUrl(trimmed)) {
-      setError("Please enter a valid Instagram post or reel URL");
-      return;
-    }
+    if (!trimmed) return setError("Please paste an Instagram URL");
+    if (!isValidInstagramUrl(trimmed))
+      return setError("Please enter a valid Instagram post or reel URL");
 
     setLoading(true);
     try {
@@ -61,39 +64,47 @@ export default function Home() {
   const downloadOne = async (item: MediaItem, index: number) => {
     setDownloadingIdx(index);
     try {
-      // Attempt 1: Proxy download through our server
-      const proxyUrl = `/api/proxy?url=${encodeURIComponent(item.url)}&type=${item.type}`;
-      const res = await fetch(proxyUrl);
+      // Try proxy download first
+      const res = await fetch(
+        `/api/proxy?url=${encodeURIComponent(item.url)}&type=${item.type}&dl=1`
+      );
 
       if (res.ok) {
         const blob = await res.blob();
-        const blobUrl = URL.createObjectURL(blob);
-        const a = document.createElement("a");
-        a.href = blobUrl;
-        a.download = `instagram_${index + 1}_${Date.now()}.${item.type === "video" ? "mp4" : "jpg"}`;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        URL.revokeObjectURL(blobUrl);
-        return;
+        if (blob.size > 0) {
+          const blobUrl = URL.createObjectURL(blob);
+          triggerDownload(
+            blobUrl,
+            `instagram_${index + 1}_${Date.now()}.${item.type === "video" ? "mp4" : "jpg"}`
+          );
+          URL.revokeObjectURL(blobUrl);
+          return;
+        }
       }
 
-      // Attempt 2: Open the direct CDN URL in a new tab
-      // User's browser can access it (residential IP not blocked)
+      // Fallback: open direct URL in new tab
       window.open(item.url, "_blank");
     } catch {
-      // Fallback: open direct URL
       window.open(item.url, "_blank");
     } finally {
       setDownloadingIdx(null);
     }
   };
 
+  const triggerDownload = (url: string, filename: string) => {
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  };
+
   const downloadAll = async () => {
     setDownloadingAll(true);
     for (let i = 0; i < items.length; i++) {
       await downloadOne(items[i], i);
-      if (i < items.length - 1) await new Promise((r) => setTimeout(r, 600));
+      if (i < items.length - 1) await new Promise((r) => setTimeout(r, 700));
     }
     setDownloadingAll(false);
   };
@@ -103,14 +114,24 @@ export default function Home() {
       const text = await navigator.clipboard.readText();
       setUrl(text);
     } catch {
-      // clipboard access denied
+      /* clipboard denied */
     }
+  };
+
+  const handlePreviewError = (idx: number) => {
+    setFailedPreviews((prev) => new Set(prev).add(idx));
+  };
+
+  // Determine the display URL for a media item
+  // Try proxy first (handles CORS), mark as failed if proxy also fails
+  const getPreviewSrc = (item: MediaItem, type: "image" | "video") => {
+    return proxyUrl(item.url, type);
   };
 
   return (
     <main className="min-h-screen flex flex-col items-center justify-center px-4 py-12">
       <div className="w-full max-w-3xl mx-auto text-center">
-        {/* Logo & Title */}
+        {/* Header */}
         <div className="mb-8">
           <div className="inline-flex items-center justify-center w-16 h-16 rounded-2xl bg-gradient-to-br from-yellow-400 via-pink-500 to-purple-600 mb-4">
             <svg className="w-8 h-8 text-white" fill="currentColor" viewBox="0 0 24 24">
@@ -120,22 +141,17 @@ export default function Home() {
           <h1 className="text-4xl md:text-5xl font-bold text-white mb-2">
             Insta<span className="instagram-gradient">Grab</span>
           </h1>
-          <p className="text-gray-400 text-lg">
-            Download Instagram reels & photos instantly
-          </p>
+          <p className="text-gray-400 text-lg">Download Instagram reels & photos instantly</p>
         </div>
 
-        {/* Input Form */}
+        {/* Form */}
         <form onSubmit={handleSubmit} className="mb-8">
           <div className="flex flex-col sm:flex-row gap-3">
             <div className="flex-1 relative glow-border rounded-xl transition-all duration-300">
               <input
                 type="text"
                 value={url}
-                onChange={(e) => {
-                  setUrl(e.target.value);
-                  setError("");
-                }}
+                onChange={(e) => { setUrl(e.target.value); setError(""); }}
                 placeholder="Paste Instagram link here..."
                 className="w-full px-5 py-4 bg-white/10 backdrop-blur-sm text-white placeholder-gray-400 rounded-xl border border-white/20 focus:outline-none focus:border-pink-500 transition-colors text-base"
               />
@@ -152,19 +168,7 @@ export default function Home() {
               disabled={loading}
               className="px-8 py-4 bg-gradient-to-r from-pink-500 to-purple-600 hover:from-pink-600 hover:to-purple-700 text-white font-semibold rounded-xl transition-all duration-300 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2 min-w-[140px]"
             >
-              {loading ? (
-                <>
-                  <Spinner />
-                  Fetching...
-                </>
-              ) : (
-                <>
-                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
-                  </svg>
-                  Get Media
-                </>
-              )}
+              {loading ? <><Spinner /> Fetching...</> : <><DownloadIcon /> Get Media</>}
             </button>
           </div>
         </form>
@@ -175,9 +179,7 @@ export default function Home() {
             <p>{error}</p>
             {debugInfo.length > 0 && (
               <details className="mt-2">
-                <summary className="cursor-pointer text-red-500/70 text-xs">
-                  Debug info (click to expand)
-                </summary>
+                <summary className="cursor-pointer text-red-500/70 text-xs">Debug info</summary>
                 <pre className="mt-1 text-[10px] text-red-400/60 whitespace-pre-wrap break-all">
                   {debugInfo.join("\n")}
                 </pre>
@@ -189,78 +191,58 @@ export default function Home() {
         {/* Results */}
         {items.length > 0 && (
           <div className="space-y-4">
-            {/* Download All */}
             {items.length > 1 && (
               <div className="flex items-center justify-between bg-white/5 backdrop-blur-sm border border-white/10 rounded-2xl px-6 py-4">
-                <span className="text-gray-300 text-sm font-medium">
-                  {items.length} items found
-                </span>
+                <span className="text-gray-300 text-sm font-medium">{items.length} items found</span>
                 <button
                   onClick={downloadAll}
                   disabled={downloadingAll}
-                  className="px-6 py-2.5 bg-gradient-to-r from-blue-500 to-indigo-600 hover:from-blue-600 hover:to-indigo-700 text-white font-semibold rounded-xl transition-all duration-300 disabled:opacity-50 flex items-center gap-2"
+                  className="px-6 py-2.5 bg-gradient-to-r from-blue-500 to-indigo-600 hover:from-blue-600 hover:to-indigo-700 text-white font-semibold rounded-xl transition-all disabled:opacity-50 flex items-center gap-2"
                 >
-                  {downloadingAll ? (
-                    <>
-                      <Spinner />
-                      Downloading All...
-                    </>
-                  ) : (
-                    <>
-                      <DownloadIcon />
-                      Download All
-                    </>
-                  )}
+                  {downloadingAll ? <><Spinner /> Downloading All...</> : <><DownloadIcon /> Download All</>}
                 </button>
               </div>
             )}
 
-            {/* Media cards */}
-            <div
-              className={`grid gap-4 ${items.length === 1 ? "grid-cols-1" : "grid-cols-1 sm:grid-cols-2"}`}
-            >
+            <div className={`grid gap-4 ${items.length === 1 ? "grid-cols-1" : "grid-cols-1 sm:grid-cols-2"}`}>
               {items.map((item, idx) => (
                 <div
                   key={idx}
                   className="bg-white/5 backdrop-blur-sm border border-white/10 rounded-2xl p-4 transition-all hover:border-white/20"
                 >
-                  {/* Preview — direct CDN URL (browser can load cross-origin media) */}
-                  <div className="mb-3 rounded-xl overflow-hidden bg-black/30 relative">
-                    {item.type === "video" ? (
+                  <div className="mb-3 rounded-xl overflow-hidden bg-black/30 relative min-h-[200px] flex items-center justify-center">
+                    {failedPreviews.has(idx) ? (
+                      <div className="text-gray-500 text-sm py-16 flex flex-col items-center gap-2">
+                        <svg className="w-10 h-10 opacity-30" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                        </svg>
+                        <span>Preview unavailable</span>
+                        <span className="text-xs text-gray-600">Click download to save the file</span>
+                      </div>
+                    ) : item.type === "video" ? (
                       <video
-                        src={item.url}
+                        src={getPreviewSrc(item, "video")}
                         controls
                         playsInline
                         className="w-full max-h-[400px] object-contain"
-                        poster={item.thumbnail || undefined}
-                        crossOrigin="anonymous"
+                        poster={item.thumbnail ? proxyUrl(item.thumbnail, "image") : undefined}
+                        onError={() => handlePreviewError(idx)}
                       />
                     ) : (
                       // eslint-disable-next-line @next/next/no-img-element
                       <img
-                        src={item.url}
+                        src={getPreviewSrc(item, "image")}
                         alt={`Instagram media ${idx + 1}`}
                         className="w-full object-contain"
                         style={{ maxHeight: "500px" }}
-                        referrerPolicy="no-referrer"
+                        onError={() => handlePreviewError(idx)}
                       />
                     )}
-                    {/* Badge */}
                     <span className="absolute top-2 left-2 px-2 py-1 rounded-lg bg-black/60 text-white text-xs font-medium flex items-center gap-1">
                       {item.type === "video" ? (
-                        <>
-                          <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24">
-                            <path d="M8 5v14l11-7z" />
-                          </svg>
-                          Video
-                        </>
+                        <><svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z" /></svg> Video</>
                       ) : (
-                        <>
-                          <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
-                          </svg>
-                          Photo
-                        </>
+                        <><svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" /></svg> Photo</>
                       )}
                     </span>
                     {items.length > 1 && (
@@ -270,29 +252,16 @@ export default function Home() {
                     )}
                   </div>
 
-                  {/* Info + Download */}
                   <div className="flex items-center justify-between">
                     <span className="text-gray-500 text-xs">
-                      {item.width && item.height
-                        ? `${item.width} × ${item.height}`
-                        : "Original size"}
+                      {item.width && item.height ? `${item.width} × ${item.height}` : "Original size"}
                     </span>
                     <button
                       onClick={() => downloadOne(item, idx)}
                       disabled={downloadingIdx === idx}
-                      className="px-5 py-2 bg-gradient-to-r from-green-500 to-emerald-600 hover:from-green-600 hover:to-emerald-700 text-white text-sm font-semibold rounded-xl transition-all duration-300 disabled:opacity-50 flex items-center gap-2"
+                      className="px-5 py-2 bg-gradient-to-r from-green-500 to-emerald-600 hover:from-green-600 hover:to-emerald-700 text-white text-sm font-semibold rounded-xl transition-all disabled:opacity-50 flex items-center gap-2"
                     >
-                      {downloadingIdx === idx ? (
-                        <>
-                          <Spinner />
-                          Saving...
-                        </>
-                      ) : (
-                        <>
-                          <DownloadIcon />
-                          Download
-                        </>
-                      )}
+                      {downloadingIdx === idx ? <><Spinner /> Saving...</> : <><DownloadIcon /> Download</>}
                     </button>
                   </div>
                 </div>
@@ -301,10 +270,7 @@ export default function Home() {
           </div>
         )}
 
-        {/* Footer */}
-        <p className="mt-12 text-gray-500 text-xs">
-          Only works with public Instagram posts and reels.
-        </p>
+        <p className="mt-12 text-gray-500 text-xs">Only works with public Instagram posts and reels.</p>
       </div>
     </main>
   );
