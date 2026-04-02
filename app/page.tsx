@@ -2,27 +2,29 @@
 
 import { useState } from "react";
 
-interface MediaResult {
+interface MediaItem {
   type: "image" | "video";
   url: string;
   thumbnail?: string;
+  width?: number;
+  height?: number;
 }
 
 export default function Home() {
   const [url, setUrl] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
-  const [media, setMedia] = useState<MediaResult | null>(null);
-  const [downloading, setDownloading] = useState(false);
+  const [items, setItems] = useState<MediaItem[]>([]);
+  const [downloadingIdx, setDownloadingIdx] = useState<number | null>(null);
+  const [downloadingAll, setDownloadingAll] = useState(false);
 
-  const isValidInstagramUrl = (url: string) => {
-    return /^https?:\/\/(www\.)?instagram\.com\/(p|reel|reels)\/[\w-]+/i.test(url);
-  };
+  const isValidInstagramUrl = (u: string) =>
+    /^https?:\/\/(www\.)?instagram\.com\/(p|reel|reels)\/[\w-]+/i.test(u);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError("");
-    setMedia(null);
+    setItems([]);
 
     const trimmed = url.trim();
     if (!trimmed) {
@@ -43,7 +45,7 @@ export default function Home() {
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Failed to fetch media");
-      setMedia(data);
+      setItems(data.items || []);
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : "Something went wrong");
     } finally {
@@ -51,19 +53,18 @@ export default function Home() {
     }
   };
 
-  const handleDownload = async () => {
-    if (!media) return;
-    setDownloading(true);
+  const downloadOne = async (item: MediaItem, index: number) => {
+    setDownloadingIdx(index);
     try {
       const res = await fetch(
-        `/api/proxy?url=${encodeURIComponent(media.url)}&type=${media.type}`
+        `/api/proxy?url=${encodeURIComponent(item.url)}&type=${item.type}&dl=1`
       );
       if (!res.ok) throw new Error("Download failed");
       const blob = await res.blob();
       const blobUrl = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = blobUrl;
-      a.download = `instagram_${Date.now()}.${media.type === "video" ? "mp4" : "jpg"}`;
+      a.download = `instagram_${index + 1}_${Date.now()}.${item.type === "video" ? "mp4" : "jpg"}`;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
@@ -71,8 +72,18 @@ export default function Home() {
     } catch {
       setError("Failed to download. Please try again.");
     } finally {
-      setDownloading(false);
+      setDownloadingIdx(null);
     }
+  };
+
+  const downloadAll = async () => {
+    setDownloadingAll(true);
+    for (let i = 0; i < items.length; i++) {
+      await downloadOne(items[i], i);
+      // small delay between downloads so browser doesn't block them
+      if (i < items.length - 1) await new Promise((r) => setTimeout(r, 500));
+    }
+    setDownloadingAll(false);
   };
 
   const handlePaste = async () => {
@@ -80,13 +91,16 @@ export default function Home() {
       const text = await navigator.clipboard.readText();
       setUrl(text);
     } catch {
-      // clipboard access denied - user can paste manually
+      // clipboard access denied
     }
   };
 
+  const proxyUrl = (mediaUrl: string, type: string) =>
+    `/api/proxy?url=${encodeURIComponent(mediaUrl)}&type=${type}`;
+
   return (
     <main className="min-h-screen flex flex-col items-center justify-center px-4 py-12">
-      <div className="w-full max-w-2xl mx-auto text-center">
+      <div className="w-full max-w-3xl mx-auto text-center">
         {/* Logo & Title */}
         <div className="mb-8">
           <div className="inline-flex items-center justify-center w-16 h-16 rounded-2xl bg-gradient-to-br from-yellow-400 via-pink-500 to-purple-600 mb-4">
@@ -131,10 +145,7 @@ export default function Home() {
             >
               {loading ? (
                 <>
-                  <svg className="animate-spin h-5 w-5" viewBox="0 0 24 24">
-                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
-                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-                  </svg>
+                  <Spinner />
                   Fetching...
                 </>
               ) : (
@@ -156,65 +167,120 @@ export default function Home() {
           </div>
         )}
 
-        {/* Media Preview */}
-        {media && (
-          <div className="bg-white/5 backdrop-blur-sm border border-white/10 rounded-2xl p-6 animate-pulse-glow">
-            <div className="mb-4 rounded-xl overflow-hidden bg-black/30">
-              {media.type === "video" ? (
-                <video
-                  src={`/api/proxy?url=${encodeURIComponent(media.url)}&type=video`}
-                  controls
-                  className="w-full max-h-[500px] object-contain"
-                  poster={media.thumbnail ? `/api/proxy?url=${encodeURIComponent(media.thumbnail)}&type=image` : undefined}
-                />
-              ) : (
-                <img
-                  src={`/api/proxy?url=${encodeURIComponent(media.url)}&type=image`}
-                  alt="Instagram media"
-                  className="w-full max-h-[500px] object-contain"
-                />
-              )}
-            </div>
-            <div className="flex items-center justify-between">
-              <span className="text-gray-400 text-sm flex items-center gap-2">
-                {media.type === "video" ? (
-                  <>
-                    <svg className="w-4 h-4" fill="currentColor" viewBox="0 0 24 24">
-                      <path d="M8 5v14l11-7z" />
-                    </svg>
-                    Reel / Video
-                  </>
-                ) : (
-                  <>
-                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
-                    </svg>
-                    Photo
-                  </>
-                )}
-              </span>
-              <button
-                onClick={handleDownload}
-                disabled={downloading}
-                className="px-6 py-2.5 bg-gradient-to-r from-green-500 to-emerald-600 hover:from-green-600 hover:to-emerald-700 text-white font-semibold rounded-xl transition-all duration-300 disabled:opacity-50 flex items-center gap-2"
-              >
-                {downloading ? (
-                  <>
-                    <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24">
-                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
-                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-                    </svg>
-                    Downloading...
-                  </>
-                ) : (
-                  <>
-                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
-                    </svg>
-                    Download
-                  </>
-                )}
-              </button>
+        {/* Results */}
+        {items.length > 0 && (
+          <div className="space-y-4">
+            {/* Download All button (for multi-item posts) */}
+            {items.length > 1 && (
+              <div className="flex items-center justify-between bg-white/5 backdrop-blur-sm border border-white/10 rounded-2xl px-6 py-4">
+                <span className="text-gray-300 text-sm font-medium">
+                  {items.length} items found
+                </span>
+                <button
+                  onClick={downloadAll}
+                  disabled={downloadingAll}
+                  className="px-6 py-2.5 bg-gradient-to-r from-blue-500 to-indigo-600 hover:from-blue-600 hover:to-indigo-700 text-white font-semibold rounded-xl transition-all duration-300 disabled:opacity-50 flex items-center gap-2"
+                >
+                  {downloadingAll ? (
+                    <>
+                      <Spinner />
+                      Downloading All...
+                    </>
+                  ) : (
+                    <>
+                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                      </svg>
+                      Download All
+                    </>
+                  )}
+                </button>
+              </div>
+            )}
+
+            {/* Media cards */}
+            <div className={`grid gap-4 ${items.length === 1 ? "grid-cols-1" : "grid-cols-1 sm:grid-cols-2"}`}>
+              {items.map((item, idx) => (
+                <div
+                  key={idx}
+                  className="bg-white/5 backdrop-blur-sm border border-white/10 rounded-2xl p-4 transition-all hover:border-white/20"
+                >
+                  {/* Preview */}
+                  <div className="mb-3 rounded-xl overflow-hidden bg-black/30 relative">
+                    {item.type === "video" ? (
+                      <video
+                        src={proxyUrl(item.url, "video")}
+                        controls
+                        className="w-full max-h-[400px] object-contain"
+                        poster={
+                          item.thumbnail
+                            ? proxyUrl(item.thumbnail, "image")
+                            : undefined
+                        }
+                      />
+                    ) : (
+                      // eslint-disable-next-line @next/next/no-img-element
+                      <img
+                        src={proxyUrl(item.url, "image")}
+                        alt={`Instagram media ${idx + 1}`}
+                        className="w-full object-contain"
+                        style={{ maxHeight: "500px" }}
+                      />
+                    )}
+                    {/* Badge */}
+                    <span className="absolute top-2 left-2 px-2 py-1 rounded-lg bg-black/60 text-white text-xs font-medium flex items-center gap-1">
+                      {item.type === "video" ? (
+                        <>
+                          <svg className="w-3 h-3" fill="currentColor" viewBox="0 0 24 24">
+                            <path d="M8 5v14l11-7z" />
+                          </svg>
+                          Video
+                        </>
+                      ) : (
+                        <>
+                          <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                          </svg>
+                          Photo
+                        </>
+                      )}
+                    </span>
+                    {items.length > 1 && (
+                      <span className="absolute top-2 right-2 px-2 py-1 rounded-lg bg-black/60 text-white text-xs font-bold">
+                        {idx + 1}/{items.length}
+                      </span>
+                    )}
+                  </div>
+
+                  {/* Info + Download */}
+                  <div className="flex items-center justify-between">
+                    <span className="text-gray-500 text-xs">
+                      {item.width && item.height
+                        ? `${item.width} × ${item.height}`
+                        : "Original size"}
+                    </span>
+                    <button
+                      onClick={() => downloadOne(item, idx)}
+                      disabled={downloadingIdx === idx}
+                      className="px-5 py-2 bg-gradient-to-r from-green-500 to-emerald-600 hover:from-green-600 hover:to-emerald-700 text-white text-sm font-semibold rounded-xl transition-all duration-300 disabled:opacity-50 flex items-center gap-2"
+                    >
+                      {downloadingIdx === idx ? (
+                        <>
+                          <Spinner />
+                          Saving...
+                        </>
+                      ) : (
+                        <>
+                          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                          </svg>
+                          Download
+                        </>
+                      )}
+                    </button>
+                  </div>
+                </div>
+              ))}
             </div>
           </div>
         )}
@@ -225,5 +291,14 @@ export default function Home() {
         </p>
       </div>
     </main>
+  );
+}
+
+function Spinner() {
+  return (
+    <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24">
+      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
+      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+    </svg>
   );
 }
