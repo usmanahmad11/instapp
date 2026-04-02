@@ -21,7 +21,9 @@ export async function GET(req: NextRequest) {
       host.includes("instagram") ||
       host.includes("cdninstagram") ||
       host.endsWith(".fbcdn.net") ||
-      host.endsWith(".fna.fbcdn.net");
+      host.endsWith(".fna.fbcdn.net") ||
+      host.endsWith(".facebook.com") ||
+      host === "i.instagram.com";
     if (!isAllowed) {
       return NextResponse.json({ error: "URL not allowed" }, { status: 403 });
     }

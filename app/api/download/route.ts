@@ -25,9 +25,15 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const cleanUrl = url.split("?")[0].replace(/\/$/, "") + "/";
+    const shortcode = getShortcode(url);
+    if (!shortcode) {
+      return NextResponse.json(
+        { error: "Could not extract post ID from URL" },
+        { status: 400 }
+      );
+    }
 
-    const items = await extractAllMedia(cleanUrl);
+    const items = await extractAllMedia(shortcode, url);
     if (!items || items.length === 0) {
       return NextResponse.json(
         {
@@ -64,51 +70,64 @@ function getShortcode(url: string): string | null {
   return match ? match[1] : null;
 }
 
-const HEADERS = {
-  "User-Agent":
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-  Accept:
-    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-  "Accept-Language": "en-US,en;q=0.9",
-  "Sec-Fetch-Dest": "document",
-  "Sec-Fetch-Mode": "navigate",
-  "Sec-Fetch-Site": "none",
-  "Sec-Fetch-User": "?1",
-  "Cache-Control": "no-cache",
-  Pragma: "no-cache",
-};
+/**
+ * Convert an Instagram shortcode to a numeric media ID.
+ * Instagram uses a base64-like encoding for shortcodes.
+ */
+function shortcodeToMediaId(shortcode: string): string {
+  const alphabet =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+  let mediaId = BigInt(0);
+  for (const char of shortcode) {
+    mediaId = mediaId * BigInt(64) + BigInt(alphabet.indexOf(char));
+  }
+  return mediaId.toString();
+}
 
-// ── Main extraction ──────────────────────────────────────────────────────────
+// ── Main pipeline ────────────────────────────────────────────────────────────
 
-async function extractAllMedia(url: string): Promise<MediaItem[]> {
-  // Method 1: Instagram JSON API (?__a=1&__d=dis)
-  const jsonItems = await fetchFromJsonApi(url);
-  if (jsonItems.length > 0) return jsonItems;
+async function extractAllMedia(
+  shortcode: string,
+  originalUrl: string
+): Promise<MediaItem[]> {
+  const cleanUrl = originalUrl.split("?")[0].replace(/\/$/, "") + "/";
 
-  // Method 2: Embed page (parse the embedded JSON)
-  const embedItems = await fetchFromEmbed(url);
+  // Method 1: Instagram Mobile API (most reliable from servers)
+  const mobileItems = await fetchFromMobileApi(shortcode);
+  if (mobileItems.length > 0) return mobileItems;
+
+  // Method 2: Instagram GraphQL API
+  const gqlItems = await fetchFromGraphQL(shortcode);
+  if (gqlItems.length > 0) return gqlItems;
+
+  // Method 3: Embed page scraping
+  const embedItems = await fetchFromEmbed(cleanUrl);
   if (embedItems.length > 0) return embedItems;
 
-  // Method 3: Main page scraping
-  const pageItems = await fetchFromMainPage(url);
+  // Method 4: Direct page with JSON extraction
+  const pageItems = await fetchFromPage(cleanUrl);
   if (pageItems.length > 0) return pageItems;
 
   return [];
 }
 
-// ── Method 1: JSON API ──────────────────────────────────────────────────────
+// ── Method 1: Mobile API ─────────────────────────────────────────────────────
 
-async function fetchFromJsonApi(url: string): Promise<MediaItem[]> {
+async function fetchFromMobileApi(shortcode: string): Promise<MediaItem[]> {
   try {
-    const jsonUrl = url.replace(/\/$/, "") + "?__a=1&__d=dis";
-    const res = await fetch(jsonUrl, {
+    const mediaId = shortcodeToMediaId(shortcode);
+    const apiUrl = `https://i.instagram.com/api/v1/media/${mediaId}/info/`;
+
+    const res = await fetch(apiUrl, {
       headers: {
-        ...HEADERS,
-        Accept: "application/json, text/plain, */*",
+        "User-Agent":
+          "Instagram 275.0.0.27.98 Android (33/13; 420dpi; 1080x2400; samsung; SM-G991B; o1s; exynos2100; en_US; 458229258)",
+        Accept: "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
         "X-IG-App-ID": "936619743392459",
+        "X-IG-WWW-Claim": "0",
         "X-Requested-With": "XMLHttpRequest",
       },
-      redirect: "follow",
     });
 
     if (!res.ok) return [];
@@ -117,32 +136,209 @@ async function fetchFromJsonApi(url: string): Promise<MediaItem[]> {
     if (!contentType.includes("json")) return [];
 
     const data = await res.json();
-    const media =
-      data?.graphql?.shortcode_media ||
-      data?.shortcode_media ||
-      data?.items?.[0];
+    const mediaItems = data?.items;
+    if (!Array.isArray(mediaItems) || mediaItems.length === 0) return [];
 
-    if (!media) return [];
-    return parseShortcodeMedia(media);
+    const item = mediaItems[0];
+    return parseMobileApiItem(item);
   } catch {
     return [];
   }
 }
 
-// ── Method 2: Embed page ─────────────────────────────────────────────────────
+function parseMobileApiItem(item: Record<string, unknown>): MediaItem[] {
+  const results: MediaItem[] = [];
+
+  // Check for carousel
+  const carouselMedia = item.carousel_media as
+    | Array<Record<string, unknown>>
+    | undefined;
+
+  if (carouselMedia && Array.isArray(carouselMedia) && carouselMedia.length > 0) {
+    for (const slide of carouselMedia) {
+      results.push(parseMobileNode(slide));
+    }
+  } else {
+    results.push(parseMobileNode(item));
+  }
+
+  return results;
+}
+
+function parseMobileNode(node: Record<string, unknown>): MediaItem {
+  const mediaType = node.media_type as number;
+  const isVideo = mediaType === 2 || !!node.video_versions;
+
+  // Get best image
+  let imageUrl = "";
+  let width: number | undefined;
+  let height: number | undefined;
+
+  const imageVersions2 = node.image_versions2 as
+    | { candidates: Array<{ url: string; width: number; height: number }> }
+    | undefined;
+
+  if (imageVersions2?.candidates && imageVersions2.candidates.length > 0) {
+    const sorted = [...imageVersions2.candidates].sort(
+      (a, b) => b.width - a.width
+    );
+    imageUrl = sorted[0].url;
+    width = sorted[0].width;
+    height = sorted[0].height;
+  }
+
+  if (isVideo) {
+    let videoUrl = "";
+    const videoVersions = node.video_versions as
+      | Array<{ url: string; width: number; height: number; type?: number }>
+      | undefined;
+
+    if (videoVersions && videoVersions.length > 0) {
+      const sorted = [...videoVersions].sort((a, b) => b.width - a.width);
+      videoUrl = sorted[0].url;
+      width = sorted[0].width;
+      height = sorted[0].height;
+    }
+
+    return {
+      type: "video",
+      url: videoUrl,
+      thumbnail: imageUrl || undefined,
+      width,
+      height,
+    };
+  }
+
+  return { type: "image", url: imageUrl, width, height };
+}
+
+// ── Method 2: GraphQL API ────────────────────────────────────────────────────
+
+async function fetchFromGraphQL(shortcode: string): Promise<MediaItem[]> {
+  try {
+    const variables = JSON.stringify({
+      shortcode,
+      child_comment_count: 0,
+      fetch_comment_count: 0,
+      parent_comment_count: 0,
+      has_threaded_comments: false,
+    });
+    const queryHash = "b3055c01b4b222b8a47dc12b090e4e64";
+    const gqlUrl = `https://www.instagram.com/graphql/query/?query_hash=${queryHash}&variables=${encodeURIComponent(variables)}`;
+
+    const res = await fetch(gqlUrl, {
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        Accept: "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "X-IG-App-ID": "936619743392459",
+        "X-Requested-With": "XMLHttpRequest",
+        Referer: "https://www.instagram.com/",
+        Origin: "https://www.instagram.com",
+      },
+    });
+
+    if (!res.ok) return [];
+
+    const contentType = res.headers.get("content-type") || "";
+    if (!contentType.includes("json")) return [];
+
+    const data = await res.json();
+    const media = data?.data?.shortcode_media;
+    if (!media) return [];
+
+    return parseGraphQLMedia(media);
+  } catch {
+    return [];
+  }
+}
+
+function parseGraphQLMedia(media: Record<string, unknown>): MediaItem[] {
+  const items: MediaItem[] = [];
+
+  const sidecar = media.edge_sidecar_to_children as
+    | { edges: Array<{ node: Record<string, unknown> }> }
+    | undefined;
+
+  if (sidecar?.edges && Array.isArray(sidecar.edges) && sidecar.edges.length > 0) {
+    for (const edge of sidecar.edges) {
+      items.push(parseGraphQLNode(edge.node));
+    }
+  } else {
+    items.push(parseGraphQLNode(media));
+  }
+
+  return items;
+}
+
+function parseGraphQLNode(node: Record<string, unknown>): MediaItem {
+  const isVideo = node.is_video === true;
+
+  let imageUrl = "";
+  let width: number | undefined;
+  let height: number | undefined;
+
+  const displayResources = node.display_resources as
+    | Array<{ src: string; config_width: number; config_height: number }>
+    | undefined;
+
+  if (displayResources && displayResources.length > 0) {
+    const sorted = [...displayResources].sort(
+      (a, b) => b.config_width - a.config_width
+    );
+    imageUrl = decodeUnicode(sorted[0].src);
+    width = sorted[0].config_width;
+    height = sorted[0].config_height;
+  } else if (typeof node.display_url === "string") {
+    imageUrl = decodeUnicode(node.display_url);
+  }
+
+  const dimensions = node.dimensions as
+    | { width: number; height: number }
+    | undefined;
+  if (!width && dimensions) {
+    width = dimensions.width;
+    height = dimensions.height;
+  }
+
+  if (isVideo && typeof node.video_url === "string") {
+    return {
+      type: "video",
+      url: decodeUnicode(node.video_url),
+      thumbnail: imageUrl || undefined,
+      width,
+      height,
+    };
+  }
+
+  return { type: "image", url: imageUrl, width, height };
+}
+
+// ── Method 3: Embed page ─────────────────────────────────────────────────────
 
 async function fetchFromEmbed(url: string): Promise<MediaItem[]> {
   try {
-    // Try both /embed/ and /embed/captioned/
     for (const suffix of ["/embed/captioned/", "/embed/"]) {
       const embedUrl = url.replace(/\/$/, "") + suffix;
       const res = await fetch(embedUrl, {
-        headers: HEADERS,
+        headers: {
+          "User-Agent":
+            "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+          Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          "Accept-Language": "en-US,en;q=0.9",
+        },
         redirect: "follow",
       });
       if (!res.ok) continue;
 
       const html = await res.text();
+
+      // Don't process login pages
+      if (html.includes("loginForm") || html.includes("/accounts/login")) {
+        continue;
+      }
+
       const items = extractFromHtml(html);
       if (items.length > 0) return items;
     }
@@ -152,27 +348,38 @@ async function fetchFromEmbed(url: string): Promise<MediaItem[]> {
   }
 }
 
-// ── Method 3: Main page ──────────────────────────────────────────────────────
+// ── Method 4: Main page ──────────────────────────────────────────────────────
 
-async function fetchFromMainPage(url: string): Promise<MediaItem[]> {
+async function fetchFromPage(url: string): Promise<MediaItem[]> {
   try {
+    // Try with Googlebot UA — Instagram serves full HTML to crawlers
     const res = await fetch(url, {
-      headers: HEADERS,
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+        Accept:
+          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+      },
       redirect: "follow",
     });
     if (!res.ok) return [];
 
     const html = await res.text();
+    if (html.includes("loginForm") || html.includes("/accounts/login")) {
+      return [];
+    }
+
     return extractFromHtml(html);
   } catch {
     return [];
   }
 }
 
-// ── HTML/Script JSON extractor (shared by embed + main page) ─────────────────
+// ── HTML JSON extraction (shared) ────────────────────────────────────────────
 
 function extractFromHtml(html: string): MediaItem[] {
-  // Strategy 1: Find window.__additionalDataLoaded(...) calls
+  // Strategy 1: window.__additionalDataLoaded
   const addDataRegex =
     /window\.__additionalDataLoaded\s*\(\s*['"][^'"]*['"]\s*,\s*(\{.+?\})\s*\)\s*;/g;
   let match: RegExpExecArray | null;
@@ -180,18 +387,17 @@ function extractFromHtml(html: string): MediaItem[] {
     try {
       const data = JSON.parse(match[1]);
       const media =
-        data?.graphql?.shortcode_media ||
-        data?.shortcode_media;
+        data?.graphql?.shortcode_media || data?.shortcode_media;
       if (media) {
-        const items = parseShortcodeMedia(media);
+        const items = parseGraphQLMedia(media);
         if (items.length > 0) return items;
       }
     } catch {
-      // try next match
+      // next
     }
   }
 
-  // Strategy 2: Find window._sharedData or similar large JSON
+  // Strategy 2: window._sharedData
   const sharedDataMatch = html.match(
     /window\._sharedData\s*=\s*(\{.+?\})\s*;/
   );
@@ -202,7 +408,7 @@ function extractFromHtml(html: string): MediaItem[] {
         data?.entry_data?.PostPage?.[0]?.graphql?.shortcode_media ||
         data?.entry_data?.PostPage?.[0]?.shortcode_media;
       if (media) {
-        const items = parseShortcodeMedia(media);
+        const items = parseGraphQLMedia(media);
         if (items.length > 0) return items;
       }
     } catch {
@@ -210,11 +416,9 @@ function extractFromHtml(html: string): MediaItem[] {
     }
   }
 
-  // Strategy 3: Find any JSON blob containing "shortcode_media" and
-  // try to extract the full object by brace-balancing from the key
+  // Strategy 3: Brace-balanced extraction of shortcode_media
   const scmIndex = html.indexOf('"shortcode_media"');
   if (scmIndex !== -1) {
-    // find the opening brace of the value
     const colonIdx = html.indexOf(":", scmIndex + 17);
     if (colonIdx !== -1) {
       const braceIdx = html.indexOf("{", colonIdx);
@@ -223,7 +427,7 @@ function extractFromHtml(html: string): MediaItem[] {
         if (jsonStr) {
           try {
             const media = JSON.parse(jsonStr);
-            const items = parseShortcodeMedia(media);
+            const items = parseGraphQLMedia(media);
             if (items.length > 0) return items;
           } catch {
             // continue
@@ -233,17 +437,10 @@ function extractFromHtml(html: string): MediaItem[] {
     }
   }
 
-  // Strategy 4: Regex-based extraction of individual media entries
-  // Collect ALL video_url and display_url / display_resources in order
-  const items = regexExtractMedia(html);
-  if (items.length > 0) return items;
-
-  return [];
+  // Strategy 4: Regex fallback
+  return regexExtractMedia(html);
 }
 
-/**
- * Extract a balanced JSON object starting at the given brace position.
- */
 function extractBalancedJson(
   str: string,
   startIdx: number,
@@ -279,30 +476,11 @@ function extractBalancedJson(
   return null;
 }
 
-// ── Regex-based fallback ─────────────────────────────────────────────────────
-
 function regexExtractMedia(html: string): MediaItem[] {
   const items: MediaItem[] = [];
   const seenUrls = new Set<string>();
 
-  // Find all "edge_sidecar_to_children" sections — carousel
-  // If present, find each node's media
-
-  // Step 1: Collect ALL video entries with their display_url (thumbnail)
-  const videoBlockRegex =
-    /"is_video"\s*:\s*true[\s\S]*?"video_url"\s*:\s*"([^"]+)"[\s\S]*?"display_url"\s*:\s*"([^"]+)"/g;
-  let vm: RegExpExecArray | null;
-  while ((vm = videoBlockRegex.exec(html)) !== null) {
-    const videoUrl = decodeUnicode(vm[1]);
-    const thumbUrl = decodeUnicode(vm[2]);
-    if (!seenUrls.has(videoUrl)) {
-      seenUrls.add(videoUrl);
-      seenUrls.add(thumbUrl); // mark thumbnail so it's not added as image
-      items.push({ type: "video", url: videoUrl, thumbnail: thumbUrl });
-    }
-  }
-
-  // Also try simpler video_url pattern
+  // Videos
   const simpleVideoRegex = /"video_url"\s*:\s*"([^"]+)"/g;
   let svm: RegExpExecArray | null;
   while ((svm = simpleVideoRegex.exec(html)) !== null) {
@@ -313,8 +491,7 @@ function regexExtractMedia(html: string): MediaItem[] {
     }
   }
 
-  // Step 2: Collect display_resources (highest res) for images
-  // Each display_resources array belongs to one media item
+  // Images from display_resources
   const drRegex = /"display_resources"\s*:\s*\[([^\]]+)\]/g;
   let drm: RegExpExecArray | null;
   while ((drm = drRegex.exec(html)) !== null) {
@@ -328,12 +505,7 @@ function regexExtractMedia(html: string): MediaItem[] {
         const bestUrl = decodeUnicode(arr[0].src);
         if (!seenUrls.has(bestUrl)) {
           seenUrls.add(bestUrl);
-          items.push({
-            type: "image",
-            url: bestUrl,
-            width: arr[0].config_width,
-            height: arr[0].config_height,
-          });
+          items.push({ type: "image", url: bestUrl });
         }
       }
     } catch {
@@ -341,7 +513,7 @@ function regexExtractMedia(html: string): MediaItem[] {
     }
   }
 
-  // Step 3: Fallback — collect display_url entries not already seen
+  // Fallback: display_url
   const duRegex = /"display_url"\s*:\s*"([^"]+)"/g;
   let dum: RegExpExecArray | null;
   while ((dum = duRegex.exec(html)) !== null) {
@@ -353,122 +525,4 @@ function regexExtractMedia(html: string): MediaItem[] {
   }
 
   return items;
-}
-
-// ── Parse structured shortcode_media JSON ────────────────────────────────────
-
-function parseShortcodeMedia(media: Record<string, unknown>): MediaItem[] {
-  const items: MediaItem[] = [];
-
-  // Check if carousel
-  const sidecar = media.edge_sidecar_to_children as
-    | { edges: Array<{ node: Record<string, unknown> }> }
-    | undefined;
-
-  if (sidecar?.edges && Array.isArray(sidecar.edges) && sidecar.edges.length > 0) {
-    // Carousel post — extract each slide
-    for (const edge of sidecar.edges) {
-      items.push(parseSingleNode(edge.node));
-    }
-  } else {
-    // Single media post
-    items.push(parseSingleNode(media));
-  }
-
-  // Also check items array (v2 API format)
-  if (items.length === 0 && Array.isArray((media as Record<string, unknown>).carousel_media)) {
-    const carousel = (media as Record<string, unknown>).carousel_media as Array<Record<string, unknown>>;
-    for (const item of carousel) {
-      items.push(parseSingleNode(item));
-    }
-  }
-
-  return items;
-}
-
-function parseSingleNode(node: Record<string, unknown>): MediaItem {
-  const isVideo =
-    node.is_video === true ||
-    node.media_type === 2 ||
-    !!node.video_url;
-
-  // Get best image URL
-  let imageUrl = "";
-  const displayResources = node.display_resources as
-    | Array<{ src: string; config_width: number; config_height: number }>
-    | undefined;
-
-  let width: number | undefined;
-  let height: number | undefined;
-
-  if (
-    displayResources &&
-    Array.isArray(displayResources) &&
-    displayResources.length > 0
-  ) {
-    // Pick highest resolution
-    displayResources.sort((a, b) => b.config_width - a.config_width);
-    imageUrl = decodeUnicode(displayResources[0].src);
-    width = displayResources[0].config_width;
-    height = displayResources[0].config_height;
-  } else if (typeof node.display_url === "string") {
-    imageUrl = decodeUnicode(node.display_url);
-  }
-
-  // v2 API: image_versions2
-  if (!imageUrl && node.image_versions2) {
-    const iv2 = node.image_versions2 as {
-      candidates: Array<{ url: string; width: number; height: number }>;
-    };
-    if (iv2.candidates && iv2.candidates.length > 0) {
-      iv2.candidates.sort((a, b) => b.width - a.width);
-      imageUrl = decodeUnicode(iv2.candidates[0].url);
-      width = iv2.candidates[0].width;
-      height = iv2.candidates[0].height;
-    }
-  }
-
-  const dimensions = node.dimensions as
-    | { width: number; height: number }
-    | undefined;
-  if (!width && dimensions) {
-    width = dimensions.width;
-    height = dimensions.height;
-  }
-
-  if (isVideo) {
-    let videoUrl = "";
-    if (typeof node.video_url === "string") {
-      videoUrl = decodeUnicode(node.video_url);
-    }
-    // v2 API: video_versions
-    if (!videoUrl && Array.isArray(node.video_versions)) {
-      const vv = node.video_versions as Array<{
-        url: string;
-        width: number;
-        height: number;
-      }>;
-      if (vv.length > 0) {
-        vv.sort((a, b) => b.width - a.width);
-        videoUrl = decodeUnicode(vv[0].url);
-        width = vv[0].width;
-        height = vv[0].height;
-      }
-    }
-
-    return {
-      type: "video",
-      url: videoUrl,
-      thumbnail: imageUrl || undefined,
-      width,
-      height,
-    };
-  }
-
-  return {
-    type: "image",
-    url: imageUrl,
-    width,
-    height,
-  };
 }
